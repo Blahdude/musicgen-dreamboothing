@@ -337,6 +337,12 @@ class DataSeq2SeqTrainingArguments:
             )
         },
     )
+    clip_duration_in_seconds: Optional[float] = field( # Add this new argument
+        default=29.9,
+        metadata={
+            "help": "Clip audio files to this duration in seconds. If None or 0, no clipping is performed based on this argument."
+        },
+    )
 
 
 @dataclass
@@ -825,8 +831,14 @@ def main():
 
     # Preprocessing the datasets.
     # We need to read the audio files as arrays and tokenize the targets.
+    # Ensure data_args is accessible in this scope.
+    # It's defined in main() and prepare_audio_features is defined within main's scope.
+    # Also, processor, conditional_audio_column_name, feature_extractor_input_name,
+    # text_column_name, add_metadata, instance_prompt, instance_prompt_tokenized,
+    # target_audio_column_name, and audio_encoder_feature_extractor need to be in scope.
+
     def prepare_audio_features(batch):
-        # load audio
+        # load audio for conditional generation if specified
         if conditional_audio_column_name is not None:
             sample = batch[conditional_audio_column_name]
             inputs = processor.feature_extractor(
@@ -836,10 +848,11 @@ def main():
                 inputs, feature_extractor_input_name
             )[0]
 
+        # Process text prompts
         if text_column_name is not None:
             text = batch[text_column_name]
             batch["input_ids"] = processor.tokenizer(text)["input_ids"]
-        elif add_metadata is not None and "metadata" in batch:
+        elif add_metadata and "metadata" in batch: # Assuming 'add_metadata' is a boolean variable in scope
             metadata = batch["metadata"]
             if instance_prompt is not None and instance_prompt != "":
                 metadata = f"{instance_prompt}, {metadata}"
@@ -847,15 +860,53 @@ def main():
         else:
             batch["input_ids"] = instance_prompt_tokenized
 
-        # load audio
+        # --- START MODIFICATION FOR CLIPPING AND MONO CONVERSION ---
+        # Load target audio
         target_sample = batch[target_audio_column_name]
-        labels = audio_encoder_feature_extractor(
-            target_sample["array"], sampling_rate=target_sample["sampling_rate"]
-        )
-        batch["labels"] = labels["input_values"]
+        audio_array = target_sample["array"]  # This is a NumPy array from datasets.Audio
+        sampling_rate = target_sample["sampling_rate"]
 
-        # take length of raw audio waveform
-        batch["target_length"] = len(target_sample["array"].squeeze())
+        # 1. Apply clipping if clip_duration_in_seconds is set in data_args
+        #    (Make sure data_args.clip_duration_in_seconds is defined, e.g., 30.0)
+        if hasattr(data_args, 'clip_duration_in_seconds') and \
+           data_args.clip_duration_in_seconds is not None and \
+           data_args.clip_duration_in_seconds > 0:
+            
+            max_len_samples = int(data_args.clip_duration_in_seconds * sampling_rate)
+            
+            current_samples = audio_array.shape[0] # Number of samples in the first dimension
+            
+            if current_samples > max_len_samples:
+                if audio_array.ndim == 1:  # Mono (num_samples,)
+                    audio_array = audio_array[:max_len_samples]
+                elif audio_array.ndim == 2:  # Stereo (num_samples, num_channels) or (num_channels, num_samples)
+                    # Assuming (num_samples, num_channels) from datasets.Audio
+                    audio_array = audio_array[:max_len_samples, :] 
+                # Add handling for other shapes if necessary, though datasets.Audio usually gives (num_samples,) or (num_samples, num_channels)
+
+        # 2. Convert to mono if stereo, as feature extractors usually expect mono
+        #    (num_samples, num_channels) -> (num_samples,)
+        if audio_array.ndim == 2 and audio_array.shape[1] > 1: # Check if it's 2D and has more than one channel
+             # Assuming shape is (num_samples, num_channels)
+            audio_array = np.mean(audio_array, axis=1)
+        elif audio_array.ndim == 2 and audio_array.shape[0] > 1 and audio_array.shape[1] == 1 : # (num_channels, num_samples) and channel is 1
+             audio_array = audio_array.squeeze() # if it's (1, num_samples) make it (num_samples,)
+        # Add more sophisticated channel handling if your data varies significantly
+
+        # 3. Process the final audio_array (which is now potentially clipped and mono)
+        #    with the audio_encoder_feature_extractor
+        labels = audio_encoder_feature_extractor(
+            audio_array, # Use the modified audio_array
+            sampling_rate=sampling_rate
+        )
+        batch["labels"] = labels["input_values"] # These are the features for EnCodec
+
+        # 4. Update target_length to reflect the (potentially clipped) audio array's sample count
+        #    The 'labels' from the feature extractor are processed features, not the raw waveform length.
+        #    We need the length of the audio_array *before* it goes into the feature extractor but *after* clipping.
+        batch["target_length"] = audio_array.shape[0] # Number of samples in the (clipped, mono) audio_array
+        # --- END MODIFICATION FOR CLIPPING AND MONO CONVERSION ---
+        
         return batch
 
     with training_args.main_process_first(desc="dataset map preprocessing"):
