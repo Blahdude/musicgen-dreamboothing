@@ -16,6 +16,10 @@
 
 """ Fine-tuning MusicGen for text-to-music using 🤗 Transformers Seq2SeqTrainer"""
 
+import os
+os.environ["HF_DATASETS_CACHE"] = "/scratch/hwdong_root/hwdong0/ocamp/hf_datasets_cache"
+os.environ["HF_HOME"]         = "/scratch/hwdong_root/hwdong0/ocamp/.cache/huggingface"
+
 import logging
 import os
 import sys
@@ -242,7 +246,7 @@ class DataSeq2SeqTrainingArguments:
         },
     )
     max_duration_in_seconds: float = field(
-        default=30.0,
+        default=10000000000000000000000000,
         metadata={
             "help": (
                 "Filter audio files that are longer than `max_duration_in_seconds` seconds to"
@@ -467,12 +471,39 @@ def main():
         )
 
     if training_args.do_train:
-        raw_datasets["train"] = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=data_args.train_split_name,
-            num_proc=num_workers,
-        )
+        # --- START MODIFICATION ---
+        print(f"DEBUG: Attempting to load training data from: {data_args.dataset_name}")
+        print(f"DEBUG: File extension: {os.path.splitext(data_args.dataset_name)[1].lower()}")
+
+        if data_args.dataset_name and os.path.splitext(data_args.dataset_name)[1].lower() == ".json":
+            print(f"DEBUG: Detected JSON file, using explicit 'json' type and 'data_files' argument for load_dataset.")
+            try:
+                raw_datasets["train"] = load_dataset(
+                    path='json',  # Explicitly specify the dataset type as 'json'
+                    data_files=data_args.dataset_name,
+                    split=data_args.train_split_name,
+                    # num_proc=num_workers, # Using num_proc with data_files for a single file might behave differently or be unnecessary.
+                                          # Consider removing or testing its effect here. If issues, try without it first.
+                )
+                print("---- RAW DATASET ----")
+                print(raw_datasets["train"])
+                print(raw_datasets["train"][0]) # Print the first example
+                # Check features/column names
+                print(raw_datasets["train"].features)
+                # Make sure 'audio' and 'caption' (or your chosen names) are present and look right
+                print(f"DEBUG: Successfully initiated loading for {data_args.dataset_name} as JSON.")
+            except Exception as e:
+                print(f"DEBUG: Error during explicit JSON load_dataset: {e}")
+                raise # Re-raise the exception to see the original error if it still occurs
+        else:
+            print(f"DEBUG: Not a JSON file or no dataset_name, using default load_dataset logic.")
+            raw_datasets["train"] = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=data_args.train_split_name,
+                num_proc=num_workers,
+            )
+        # --- END MODIFICATION ---
 
         if data_args.target_audio_column_name not in raw_datasets["train"].column_names:
             raise ValueError(
@@ -678,20 +709,20 @@ def main():
         {
             "pad_token_id": model_args.pad_token_id
             if model_args.pad_token_id is not None
-            else model.config.pad_token_id,
+            else config.pad_token_id,
             "decoder_start_token_id": model_args.decoder_start_token_id
             if model_args.decoder_start_token_id is not None
-            else model.config.decoder_start_token_id,
+            else config.decoder_start_token_id,
         }
     )
     config.decoder.update(
         {
             "pad_token_id": model_args.pad_token_id
             if model_args.pad_token_id is not None
-            else model.config.decoder.pad_token_id,
+            else config.decoder.pad_token_id,
             "decoder_start_token_id": model_args.decoder_start_token_id
             if model_args.decoder_start_token_id is not None
-            else model.config.decoder.decoder_start_token_id,
+            else config.decoder.decoder_start_token_id,
         }
     )
 
@@ -737,19 +768,24 @@ def main():
     # so that we just need to set the correct target sampling rate and normalize the input
     # via the `feature_extractor`
 
-    # resample target audio
-    dataset_sampling_rate = (
-        next(iter(raw_datasets.values()))
-        .features[data_args.target_audio_column_name]
-        .sampling_rate
-    )
-    if dataset_sampling_rate != audio_encoder_feature_extractor.sampling_rate:
-        raw_datasets = raw_datasets.cast_column(
+    # --- START MODIFICATION ---
+    # Directly cast the audio column to the Audio feature type with the target sampling rate.
+    
+    # Get the target sampling rate from the feature extractor
+    # (The log shows this is 32000 for facebook/musicgen-small)
+    target_sr = audio_encoder_feature_extractor.sampling_rate 
+    
+    print(f"DEBUG: Ensuring audio column '{data_args.target_audio_column_name}' in all dataset splits is cast to Audio type with target sampling rate: {target_sr}")
+
+    # Iterate over all splits in raw_datasets (e.g., "train", "eval")
+    for split_name_key in list(raw_datasets.keys()): # Use list(raw_datasets.keys()) to avoid issues if modifying dict during iteration (though cast_column returns new obj)
+        print(f"DEBUG: Processing split: {split_name_key}")
+        raw_datasets[split_name_key] = raw_datasets[split_name_key].cast_column(
             data_args.target_audio_column_name,
-            datasets.features.Audio(
-                sampling_rate=audio_encoder_feature_extractor.sampling_rate
-            ),
+            datasets.features.Audio(sampling_rate=target_sr, decode=True),
         )
+    print(f"DEBUG: Audio column casting complete for all splits.")
+    # --- END MODIFICATION ---
 
     if data_args.conditional_audio_column_name is not None:
         dataset_sampling_rate = (
@@ -881,9 +917,7 @@ def main():
         vectorized_datasets = vectorized_datasets.map(
             apply_audio_decoder,
             with_rank=True,
-            num_proc=torch.cuda.device_count()
-            if torch.cuda.device_count() > 0
-            else num_workers,
+            num_proc=1,
             desc="Apply encodec",
         )
 
@@ -987,7 +1021,7 @@ def main():
         model.enable_input_require_grads()
         model = get_peft_model(model, config)
         model.print_trainable_parameters()
-        logger.info(f"Modules with Lora: {model.targeted_module_names}")
+        # logger.info(f"Modules with Lora: {model.targeted_module_names}")
 
     # Initialize MusicgenTrainer
     trainer = MusicgenTrainer(
